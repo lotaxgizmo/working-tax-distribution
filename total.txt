@@ -1,0 +1,1622 @@
+{
+    "combinedprocess.js": {
+        import { distributeMain } from "./distribute.js";
+import { withdrawMain } from "./withdrawTax.js";
+import testSellMain from "./JupiterSell.js";
+import dotenv from "dotenv";
+import MongoManager from "./mongoManager.js";
+import SolanaManager from "./solanaManager.js";
+import path from "path";
+import { fileURLToPath } from "url";
+import chokidar from "chokidar";
+import * as fs from "fs";
+import { transferToTwoWallets } from "./transferLogic.js";
+
+// Color utility functions.
+const colors = {
+  blue: (text) => `\x1b[34m${text}\x1b[0m`,
+  green: (text) => `\x1b[32m${text}\x1b[0m`,
+  red: (text) => `\x1b[31m${text}\x1b[0m`,
+  yellow: (text) => `\x1b[33m${text}\x1b[0m`,
+};
+
+// Get the directory name of the current module
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// File to store accumulated SOL amount
+const ACCUMULATOR_FILE = "accumulated_sol.json";
+
+// Function to reload environment variables
+function reloadEnv() {
+  try {
+    console.log(colors.blue("Reloading environment variables..."));
+    dotenv.config({ override: true });
+    console.log(colors.green("Environment variables reloaded successfully"));
+    return true;
+  } catch (error) {
+    console.error(colors.red("Error reloading environment variables:"), error);
+    return false;
+  }
+}
+
+// Function to watch for file changes
+function setupFileWatchers() {
+  try {
+    // Watch .env file
+    const envPath = path.resolve(process.cwd(), ".env");
+    const envWatcher = chokidar.watch(envPath, {
+      ignoreInitial: true,
+      persistent: true,
+      usePolling: true,
+      interval: 1000,
+      awaitWriteFinish: {
+        stabilityThreshold: 2000,
+        pollInterval: 100,
+      },
+    });
+
+    envWatcher.on("change", () => {
+      console.log(colors.blue(".env file changed, reloading configuration..."));
+      if (reloadEnv()) {
+        console.log(
+          colors.blue("Restarting intervals with new configuration...")
+        );
+        restartIntervals();
+      }
+    });
+
+    // Watch JS files in the process directory
+    const processDir = __dirname;
+    const jsWatcher = chokidar.watch("*.js", {
+      cwd: processDir,
+      ignoreInitial: true,
+      persistent: true,
+      usePolling: true,
+      interval: 1000,
+      awaitWriteFinish: {
+        stabilityThreshold: 2000,
+        pollInterval: 100,
+      },
+    });
+
+    jsWatcher.on("change", (filepath) => {
+      console.log(
+        colors.blue(
+          `Detected change in ${filepath}, restarting entire process via PM2...`
+        )
+      );
+      process.exit(0);
+    });
+
+    // Handle watcher errors
+    envWatcher.on("error", (error) =>
+      console.error(colors.red("Env watcher error:"), error)
+    );
+    jsWatcher.on("error", (error) =>
+      console.error(colors.red("JS watcher error:"), error)
+    );
+
+    console.log(colors.blue("PM2 File watchers set up successfully"));
+  } catch (error) {
+    console.error(colors.red("Error setting up file watchers:"), error);
+    console.log(colors.yellow("Continuing without file watchers..."));
+  }
+}
+
+// Function to load accumulated amount from file
+function loadAccumulatedAmount() {
+  try {
+    if (fs.existsSync(ACCUMULATOR_FILE)) {
+      const data = JSON.parse(fs.readFileSync(ACCUMULATOR_FILE, "utf8"));
+      return data.amount || 0;
+    }
+  } catch (error) {
+    console.error(colors.red("Error loading accumulated amount:"), error);
+  }
+  return 0;
+}
+
+// Function to save accumulated amount to file
+function saveAccumulatedAmount(amount) {
+  try {
+    fs.writeFileSync(ACCUMULATOR_FILE, JSON.stringify({ amount }, null, 2));
+  } catch (error) {
+    console.error(colors.red("Error saving accumulated amount:"), error);
+  }
+}
+
+// Initialize totalSoldAmount from file
+let totalSoldAmount = loadAccumulatedAmount();
+console.log(colors.blue(`Loaded accumulated SOL amount: ${totalSoldAmount}`));
+
+// Single accumulator to track total sold amount
+let mongoManager = null;
+let solanaManager = null;
+
+// Interval references
+let withdrawInterval = null;
+let sellInterval = null;
+let distributeInterval = null;
+
+// Track last run times
+let lastRunTimes = {
+  withdraw: Date.now(),
+  sell: Date.now(),
+  distribute: Date.now(),
+};
+
+async function initializeConnections() {
+  try {
+    mongoManager = await MongoManager.getInstance();
+    solanaManager = await SolanaManager.getInstance();
+    console.log("All connections initialized successfully");
+  } catch (error) {
+    console.error("Error initializing connections:", error);
+    throw error;
+  }
+}
+
+async function runWithRetry(operation, name, maxRetries = 3, delay = 5000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      console.error(
+        `Attempt ${attempt}/${maxRetries} failed for ${name}:`,
+        error.message || error
+      );
+      if (attempt < maxRetries) {
+        console.log(`Retrying ${name} in ${delay / 1000} seconds...`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+  console.log(
+    `All ${maxRetries} attempts failed for ${name}, will try again next interval`
+  );
+  return null;
+}
+
+async function runWithdraw() {
+  try {
+    await runWithRetry(async () => {
+      await withdrawMain();
+    }, "withdraw");
+    lastRunTimes.withdraw = Date.now();
+    console.log(
+      `${new Date().toISOString()} - ${colors.green(
+        "Withdraw completed successfully."
+      )}`
+    );
+  } catch (error) {
+    lastRunTimes.withdraw = Date.now();
+    console.error(
+      `${new Date().toISOString()} - ${colors.red("Error during withdraw:")}`,
+      error.message || error
+    );
+    console.log(
+      `${new Date().toISOString()} - ${colors.yellow(
+        "Continuing despite withdraw error..."
+      )}`
+    );
+  }
+}
+
+async function runSell() {
+  try {
+    const amountSold = await runWithRetry(async () => {
+      return await testSellMain();
+    }, "sell");
+
+    if (amountSold) {
+      const amountForOtherWallet = amountSold * 0;
+      const amountForDistribution = amountSold * 1;
+      // const amountForOtherWallet = amountSold * 0.3;
+      // const amountForDistribution = amountSold * 0.7;
+
+      try {
+        const transferSignature = await transferToTwoWallets(
+          solanaManager.connection,
+          solanaManager.wallet,
+          amountForOtherWallet
+        );
+        console.log(
+          `${new Date().toISOString()} - ${colors.green(
+            `30% transfer completed with signature: ${transferSignature}`
+          )}`
+        );
+      } catch (transferError) {
+        console.error(
+          `${new Date().toISOString()} - ${colors.red(
+            "Error transferring 30%:"
+          )}`,
+          transferError
+        );
+      }
+
+      totalSoldAmount += amountForDistribution;
+      saveAccumulatedAmount(totalSoldAmount);
+      lastRunTimes.sell = Date.now();
+      console.log(
+        `${new Date().toISOString()} - ${colors.green(
+          `Successfully sold ${amountSold} SOL. ` +
+            `30% (${amountForOtherWallet} SOL) sent to wallets, ` +
+            `70% (${amountForDistribution} SOL) accumulated for distribution. ` +
+            `Total accumulated: ${totalSoldAmount} SOL`
+        )}`
+      );
+    }
+  } catch (error) {
+    lastRunTimes.sell = Date.now();
+
+    if (error.transactionLogs) {
+      console.log(
+        `${new Date().toISOString()} - ${colors.yellow(
+          "Transaction logs available, analyzing error..."
+        )}`
+      );
+      const logs = error.transactionLogs;
+
+      if (logs.some((log) => log.includes("0x1771"))) {
+        console.log(
+          `${new Date().toISOString()} - ${colors.yellow(
+            "Jupiter swap error detected (0x1771) - likely price impact or slippage issue"
+          )}`
+        );
+      } else if (logs.some((log) => log.includes("custom program error"))) {
+        const errorLog = logs.find((log) =>
+          log.includes("custom program error")
+        );
+        console.log(
+          `${new Date().toISOString()} - ${colors.yellow(
+            "Program error detected:"
+          )}`,
+          errorLog
+        );
+      }
+
+      console.log(
+        `${new Date().toISOString()} - ${colors.yellow("Transaction details:")}`
+      );
+      console.log(
+        "Message:",
+        error.transactionMessage || "No message available"
+      );
+      console.log("Signature:", error.signature || "No signature available");
+    } else {
+      console.error(
+        `${new Date().toISOString()} - ${colors.red(
+          "Error during sell operation:"
+        )}`,
+        error.message || error
+      );
+    }
+    console.log(
+      `${new Date().toISOString()} - ${colors.yellow(
+        "Will retry on next interval"
+      )}`
+    );
+  }
+}
+
+async function runDistribute() {
+  try {
+    console.log(
+      colors.blue(`[${new Date().toISOString()}] Starting distribution...`)
+    );
+    const amountToDistribute = totalSoldAmount;
+    console.log(
+      colors.blue(
+        `[${new Date().toISOString()}] Amount to distribute: ${amountToDistribute} SOL`
+      )
+    );
+    if (amountToDistribute > 0) {
+      totalSoldAmount = 0;
+      saveAccumulatedAmount(0);
+      await runWithRetry(async () => {
+        console.log(
+          colors.blue(`[${new Date().toISOString()}] Calling distributeMain...`)
+        );
+        await distributeMain(amountToDistribute);
+        console.log(
+          colors.green(`[${new Date().toISOString()}] distributeMain completed`)
+        );
+      }, "distribute");
+      lastRunTimes.distribute = Date.now();
+      console.log(
+        colors.green(
+          `[${new Date().toISOString()}] Distribution cycle completed. Distributed: ${amountToDistribute} tokens`
+        )
+      );
+    } else {
+      lastRunTimes.distribute = Date.now();
+      console.log(
+        colors.yellow(
+          `[${new Date().toISOString()}] No amount to distribute at this time`
+        )
+      );
+    }
+  } catch (error) {
+    lastRunTimes.distribute = Date.now();
+    console.error(
+      colors.red(`[${new Date().toISOString()}] Error during distribution:`),
+      error.message || error
+    );
+    console.error(
+      colors.red(`[${new Date().toISOString()}] Error stack:`),
+      error.stack
+    );
+    totalSoldAmount = amountToDistribute;
+    saveAccumulatedAmount(totalSoldAmount);
+    console.log(
+      colors.yellow(
+        `[${new Date().toISOString()}] Distribution failed, amount restored for next attempt`
+      )
+    );
+  }
+}
+
+async function safeStartIntervals() {
+  while (true) {
+    try {
+      console.log("Starting intervals...");
+      const withdrawIntervalTime =
+        parseInt(process.env.WITHDRAW_INTERVAL) || 20000;
+      const sellIntervalTime = parseInt(process.env.SELL_INTERVAL) || 30000;
+      const distributeIntervalTime =
+        parseInt(process.env.DISTRIBUTE_INTERVAL) || 60000;
+
+      withdrawInterval = setInterval(runWithdraw, withdrawIntervalTime);
+      sellInterval = setInterval(runSell, sellIntervalTime);
+      distributeInterval = setInterval(runDistribute, distributeIntervalTime);
+
+      console.log("All intervals started successfully");
+      return;
+    } catch (error) {
+      console.error("Error starting intervals:", error.message || error);
+      console.log("Retrying in 5 seconds...");
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+  }
+}
+
+function restartIntervals() {
+  console.log("Restarting all intervals...");
+  try {
+    if (withdrawInterval) clearInterval(withdrawInterval);
+    if (sellInterval) clearInterval(sellInterval);
+    if (distributeInterval) clearInterval(distributeInterval);
+
+    withdrawInterval = null;
+    sellInterval = null;
+    distributeInterval = null;
+
+    safeStartIntervals();
+  } catch (error) {
+    console.error("Error in restartIntervals:", error.message || error);
+    setTimeout(restartIntervals, 5000);
+  }
+}
+
+function runHealthCheck() {
+  try {
+    const now = Date.now();
+    const withdrawIntervalTime =
+      parseInt(process.env.WITHDRAW_INTERVAL) || 20000;
+    const sellIntervalTime = parseInt(process.env.SELL_INTERVAL) || 30000;
+    const distributeIntervalTime =
+      parseInt(process.env.DISTRIBUTE_INTERVAL) || 60000;
+
+    const maxDelay = {
+      withdraw: withdrawIntervalTime * 3,
+      sell: sellIntervalTime * 3,
+      distribute: distributeIntervalTime * 2,
+    };
+
+    let needsRestart = false;
+
+    if (now - lastRunTimes.withdraw > maxDelay.withdraw) {
+      console.log(
+        `${new Date().toISOString()} - Withdraw interval might be stuck`
+      );
+      needsRestart = true;
+    }
+    if (now - lastRunTimes.sell > maxDelay.sell) {
+      console.log(`${new Date().toISOString()} - Sell interval might be stuck`);
+      needsRestart = true;
+    }
+    if (now - lastRunTimes.distribute > maxDelay.distribute) {
+      console.log(
+        `${new Date().toISOString()} - Distribute interval might be stuck`
+      );
+      needsRestart = true;
+    }
+
+    if (!withdrawInterval || !sellInterval || !distributeInterval) {
+      console.log(
+        `${new Date().toISOString()} - One or more intervals are not running`
+      );
+      needsRestart = true;
+    }
+
+    if (needsRestart) {
+      console.log(
+        `${new Date().toISOString()} - Detected stuck intervals, initiating restart...`
+      );
+      restartIntervals();
+    }
+  } catch (error) {
+    console.error(
+      `${new Date().toISOString()} - Error in health check:`,
+      error.message || error
+    );
+    setTimeout(restartIntervals, 5000);
+  }
+}
+
+async function safeInitializeConnections() {
+  while (true) {
+    try {
+      await initializeConnections();
+      return;
+    } catch (error) {
+      console.error(
+        "Error during initialization, retrying in 5 seconds:",
+        error
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+  }
+}
+
+async function runProcesses() {
+  while (true) {
+    try {
+      setupFileWatchers();
+      await safeInitializeConnections();
+
+      console.log("Running initial operations...");
+      await runWithdraw().catch((error) =>
+        console.error("Initial withdraw error:", error)
+      );
+      await runSell().catch((error) =>
+        console.error("Initial sell error:", error)
+      );
+      console.log("Initial operations completed");
+
+      console.log("Setting up recurring operations...");
+      await safeStartIntervals();
+
+      const healthCheckInterval =
+        parseInt(process.env.HEALTH_CHECK_INTERVAL) || 60000;
+      setInterval(runHealthCheck, healthCheckInterval);
+
+      setInterval(() => {
+        console.log(
+          "Process heartbeat - Still running at:",
+          new Date().toISOString()
+        );
+      }, 300000);
+
+      await new Promise(() => {});
+    } catch (error) {
+      console.error("Critical error in main process:", error.message || error);
+      console.log("Restarting entire process in 5 seconds...");
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+  }
+}
+
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", error);
+  console.log("Attempting recovery...");
+  restartIntervals();
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+  console.log("Attempting recovery...");
+  restartIntervals();
+});
+
+process.on("SIGINT", async () => {
+  console.log("Gracefully shutting down...");
+  if (withdrawInterval) clearInterval(withdrawInterval);
+  if (sellInterval) clearInterval(sellInterval);
+  if (distributeInterval) clearInterval(distributeInterval);
+  if (mongoManager) {
+    await mongoManager.disconnect();
+  }
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  console.log("Gracefully shutting down...");
+  if (withdrawInterval) clearInterval(withdrawInterval);
+  if (sellInterval) clearInterval(sellInterval);
+  if (distributeInterval) clearInterval(distributeInterval);
+  if (mongoManager) {
+    await mongoManager.disconnect();
+  }
+  process.exit(0);
+});
+
+runProcesses();
+
+    },
+
+    "config.js": {
+import { Connection, Keypair } from '@solana/web3.js';
+import * as fs from 'fs';
+import dotenv from 'dotenv';
+dotenv.config();
+// Network Configuration
+export const HELIUS_CONFIG = {
+    rpcUrl: process.env.HELIUS_RPC_URL
+};
+export const RPC_ENDPOINT = HELIUS_CONFIG.rpcUrl;
+export const NETWORK = process.env.SOLANA_NETWORK;
+// export const RPC_ENDPOINT = 'https://api.devnet.solana.com';
+// export const NETWORK = 'devnet';
+// Connection instance
+console.log('RPC Endpoint:', RPC_ENDPOINT);
+export const connection = new Connection(RPC_ENDPOINT, 'confirmed');
+// File Configuration
+export const DATA_FILE = process.env.DATA_FILE;
+export const WALLET_FILE = process.env.WALLET_FILE;
+export const TAX_COLLECTOR_WALLET_FILE = process.env.TAX_COLLECTOR_WALLET_FILE; // Add the wallet that will collect taxes
+// Token Configuration
+export const TOKEN_DECIMALS = 9;
+export const TRANSFER_FEE_BASIS_POINTS = 500; // 5%
+export const MAX_FEE = BigInt(2 ** 53 - 1); // Unlimited (max safe integer)
+export const INITIAL_SUPPLY = 1000000; // Initial token supply (1 million tokens)
+// Authority Configuration
+export let USE_SINGLE_AUTHORITY = true; // Toggle this to true/false
+export let USE_TAX_COLLECTOR_AS_AUTHORITY = true; // If true, tax collector will also have withdrawal authority
+export let REVOKE_MINT_AUTHORITY = false; // If true, mint authority will be revoked after token creation
+// MongoDB Configuration
+export const MONGO_CONFIG = {
+    uri: process.env.MONGODB_URI,
+    dbName: process.env.MONGODB_DB_NAME,
+    collectionName: process.env.MONGODB_COLLECTION
+};
+// Helper function to get authority
+export function getAuthority() {
+    if (!fs.existsSync(WALLET_FILE)) {
+        throw new Error(`Wallet file ${WALLET_FILE} not found`);
+    }
+    return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(WALLET_FILE, 'utf-8'))));
+}
+// Helper function to get tax collector keypair
+export function getTaxCollector() {
+    if (!fs.existsSync(TAX_COLLECTOR_WALLET_FILE)) {
+        throw new Error(`Tax collector wallet file ${TAX_COLLECTOR_WALLET_FILE} not found`);
+    }
+    return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(TAX_COLLECTOR_WALLET_FILE, 'utf-8'))));
+}
+// Get the withdrawal authority (either tax collector or main authority)
+export function getWithdrawalAuthority() {
+    return USE_TAX_COLLECTOR_AS_AUTHORITY ? getTaxCollector() : getAuthority();
+}
+// Helper Functions
+export function generateExplorerTxUrl(txId) {
+    return `https://solscan.io/tx/${txId}?cluster=${NETWORK}`;
+}
+// Calculate amount with decimals
+export function getTokenAmount(amount) {
+    return BigInt(amount * Math.pow(10, TOKEN_DECIMALS));
+}
+// Calculate fee for a transfer amount
+export function calculateFee(transferAmount) {
+    const calcFee = (transferAmount * BigInt(TRANSFER_FEE_BASIS_POINTS)) / BigInt(10000);
+    return calcFee > MAX_FEE ? MAX_FEE : calcFee;
+}
+// Get initial supply in base units (including decimals)
+export function getInitialSupply() {
+    return getTokenAmount(INITIAL_SUPPLY);
+}
+},
+
+    "distribute.js": {
+        import * as anchor from "@coral-xyz/anchor";
+        import { Program } from "@coral-xyz/anchor";
+        import {
+          PublicKey,
+          Keypair,
+          Transaction,
+          ComputeBudgetProgram,
+          SystemProgram,
+          Connection,
+        } from "@solana/web3.js";
+        import { readFileSync } from "fs";
+        import BN from "bn.js";
+        import MongoManager from "./mongoManager.js";
+        import SolanaManager from "./solanaManager.js";
+        
+        const IDL = {
+          version: "0.1.0",
+          name: "sol_distribution",
+          instructions: [
+            {
+              name: "distributeByPercentage",
+              accounts: [
+                { name: "fundingAccount", isMut: true, isSigner: true },
+                { name: "systemProgram", isMut: false, isSigner: false },
+              ],
+              args: [
+                { name: "totalAmount", type: "u64" },
+                { name: "percentages", type: { vec: "u32" } },
+              ],
+            },
+          ],
+        };
+        
+        const PROGRAM_ID = new PublicKey(
+          "75VwsLZCFLbPsdfMAHs12AUtjy4Q9P48ESVLiUbEPE29"
+        );
+        
+        const solToLamports = (sol) => Math.floor(sol * 1_000_000_000);
+        
+        async function sendWithRetry(
+          connection,
+          serializedTx,
+          options,
+          maxRetries = 25
+        ) {
+          let retries = 0;
+          while (retries < maxRetries) {
+            try {
+              const signature = await connection.sendRawTransaction(
+                serializedTx,
+                options
+              );
+              return signature;
+            } catch (error) {
+              if (error.message.includes("429")) {
+                const delay = Math.min(500 * Math.pow(2, retries), 10000);
+                console.log(
+                  `\x1b[95mServer responded with 429. Retrying (${
+                    retries + 1
+                  }/${maxRetries}) after ${delay}ms...\x1b[0m`
+                );
+                await new Promise((resolve) => setTimeout(resolve, delay));
+                retries++;
+              } else {
+                throw error;
+              }
+            }
+          }
+          throw new Error(
+            `Max retries (${maxRetries}) exceeded for sending transaction`
+          );
+        }
+        
+        async function batchDistribute(program, totalAmount, recipientShares) {
+          const batchSize = 10;
+          const connection = program.provider.connection;
+          const wallet = program.provider.wallet;
+        
+          const MIN_PRIORITY_FEE_MICRO_LAMPORTS = 80_000;
+          const recentFees = await connection.getRecentPrioritizationFees();
+          const medianFee =
+            recentFees.length > 0
+              ? recentFees[Math.floor(recentFees.length / 2)].prioritizationFee
+              : MIN_PRIORITY_FEE_MICRO_LAMPORTS;
+          const priorityFeeMicroLamports = Math.max(80_000, medianFee * 1.5);
+        
+          console.log(
+            `\x1b[95mMedian fee: ${medianFee}, Using priority fee: ${priorityFeeMicroLamports} microLamports\x1b[0m`
+          );
+        
+          const numBatches = Math.ceil(recipientShares.length / batchSize);
+          const blockhashPromises = Array(numBatches)
+            .fill(null)
+            .map(() => connection.getLatestBlockhash("confirmed"));
+          const blockhashData = await Promise.all(blockhashPromises);
+          const blockhashes = blockhashData.map((b) => ({
+            blockhash: b.blockhash,
+            lastValidBlockHeight: b.lastValidBlockHeight,
+          }));
+        
+          const signaturePromises = [];
+          for (let i = 0; i < recipientShares.length; i += batchSize) {
+            const batchIndex = i / batchSize;
+            const batch = recipientShares.slice(i, i + batchSize);
+            const recipients = batch.map((share) => share.recipient);
+            const percentages = batch.map((share) =>
+              Math.floor(share.percentage * 100)
+            );
+            const { blockhash, lastValidBlockHeight } = blockhashes[batchIndex];
+        
+            const instruction = await program.methods
+              .distributeByPercentage(new BN(totalAmount), percentages)
+              .accounts({
+                fundingAccount: wallet.publicKey,
+                systemProgram: SystemProgram.programId,
+              })
+              .remainingAccounts(
+                recipients.map((recipient) => ({
+                  pubkey: recipient,
+                  isWritable: true,
+                  isSigner: false,
+                }))
+              )
+              .instruction();
+        
+            const transaction = new Transaction({
+              recentBlockhash: blockhash,
+              feePayer: wallet.publicKey,
+            });
+        
+            transaction.add(
+              ComputeBudgetProgram.setComputeUnitPrice({
+                microLamports: priorityFeeMicroLamports,
+              })
+            );
+            transaction.add(instruction);
+        
+            const signedTx = await wallet.signTransaction(transaction);
+            const signaturePromise = sendWithRetry(connection, signedTx.serialize(), {
+              skipPreflight: true,
+              preflightCommitment: "confirmed",
+            }).then(async (signature) => {
+              await connection.confirmTransaction(
+                {
+                  signature,
+                  blockhash,
+                  lastValidBlockHeight,
+                },
+                "confirmed"
+              );
+              return signature;
+            });
+            signaturePromises.push(signaturePromise);
+          }
+        
+          const results = await Promise.allSettled(signaturePromises);
+          const successful = [];
+          const failed = [];
+          results.forEach((result, index) => {
+            if (result.status === "fulfilled") {
+              successful.push(result.value);
+            } else {
+              failed.push({
+                index,
+                error: result.reason?.message || "Unknown error",
+              });
+            }
+          });
+          return { successful, failed };
+        }
+        
+        export async function distributeMain(soldAmount) {
+          try {
+            const solanaManager = await SolanaManager.getInstance();
+            const provider = solanaManager.getProvider();
+            const program = new Program(IDL, PROGRAM_ID, provider);
+        
+            const mongoManager = await MongoManager.getInstance();
+            const collection = mongoManager.getCollection(
+              process.env.MONGODB_COLLECTION
+            );
+            console.log(
+              `[${new Date().toISOString()}] \x1b[95mFetching recipients from MongoDB...\x1b[0m`
+            );
+            const recipientsData = await collection.find({}).toArray();
+            console.log(
+              `[${new Date().toISOString()}] \x1b[95mRetrieved ${
+                recipientsData.length
+              } recipients\x1b[0m`
+            );
+        
+            if (!recipientsData || recipientsData.length === 0) {
+              throw new Error("No recipients found in MongoDB collection");
+            }
+        
+            const recipientShares = recipientsData
+              .filter((doc) => {
+                if (!doc.address || typeof doc.address !== "string") {
+                  console.warn(
+                    `[${new Date().toISOString()}] \x1b[93mInvalid address in doc: ${JSON.stringify(
+                      doc
+                    )}\x1b[0m`
+                  );
+                  return false;
+                }
+                if (typeof doc.percentage !== "number") {
+                  console.warn(
+                    `[${new Date().toISOString()}] \x1b[93mInvalid percentage in doc: ${JSON.stringify(
+                      doc
+                    )}\x1b[0m`
+                  );
+                  return false;
+                }
+                return true;
+              })
+              .map((doc) => {
+                try {
+                  return {
+                    recipient: new PublicKey(doc.address),
+                    percentage: doc.percentage,
+                  };
+                } catch (error) {
+                  console.warn(
+                    `[${new Date().toISOString()}] \x1b[93mFailed to parse address ${
+                      doc.address
+                    }:\x1b[0m`,
+                    error
+                  );
+                  return null;
+                }
+              })
+              .filter((share) => share !== null);
+        
+            if (recipientShares.length === 0) {
+              throw new Error("No valid recipients found after processing");
+            }
+        
+            console.log(
+              `[${new Date().toISOString()}] \x1b[95mFound ${
+                recipientShares.length
+              } valid recipients in MongoDB\x1b[0m`
+            );
+            console.log(
+              `[${new Date().toISOString()}] \x1b[95mDistributing ${soldAmount} SOL\x1b[0m`
+            );
+            console.log(
+              `[${new Date().toISOString()}] \x1b[95mStarting SOL distribution...\x1b[0m`
+            );
+        
+            const lamports = solToLamports(soldAmount);
+            const { successful, failed } = await batchDistribute(
+              program,
+              lamports,
+              recipientShares
+            );
+        
+            console.log(
+              `[${new Date().toISOString()}] \x1b[95mDistribution completed!\x1b[0m`
+            );
+            console.log(
+              `[${new Date().toISOString()}] \x1b[95mTotal successful transactions: ${
+                successful.length
+              }\x1b[0m`
+            );
+            console.log(
+              `[${new Date().toISOString()}] \x1b[95mTotal failed transactions: ${
+                failed.length
+              }\x1b[0m`
+            );
+        
+            if (successful.length > 0) {
+              console.log(
+                `[${new Date().toISOString()}] \x1b[95mSuccessful Transactions:\x1b[0m`
+              );
+              successful.forEach((sig, i) => {
+                console.log(
+                  `[${new Date().toISOString()}] \x1b[95mTransaction ${
+                    i + 1
+                  } signature: https://solscan.io/tx/${sig}?cluster=mainnet\x1b[0m`
+                );
+              });
+            }
+        
+            if (failed.length > 0) {
+              console.log(`\n[${new Date().toISOString()}] Failed Transactions:`);
+              failed.forEach(({ index, error }) => {
+                console.log(
+                  `[${new Date().toISOString()}] Batch ${
+                    index + 1
+                  } failed with error: ${error}`
+                );
+              });
+            }
+          } catch (error) {
+            console.error(
+              `[${new Date().toISOString()}] \x1b[31mDistribution error: ${
+                error.message
+              }\x1b[0m`
+            );
+            console.error(
+              `[${new Date().toISOString()}] \x1b[31mError stack:\x1b[0m`,
+              error.stack
+            );
+            throw error;
+          }
+        }
+        
+        // distributeMain(0.000001);
+        
+        export { batchDistribute, solToLamports };
+        
+        
+        },
+
+    "jupiterSell.js": {
+        
+import {
+    Connection,
+    Keypair,
+    VersionedTransaction,
+    LAMPORTS_PER_SOL,
+    PublicKey,
+  } from "@solana/web3.js";
+  import { getAssociatedTokenAddress, getAccount } from "@solana/spl-token";
+  import fetch from "cross-fetch";
+  import * as fs from "fs";
+  import dotenv from "dotenv";
+  
+  dotenv.config();
+  
+  // Environment variable getters
+  const getInputMint = () => process.env.TOKEN_MINT_ADDRESS;
+  const getSlippageBps = () => parseInt(process.env.SLIPPAGE_BPS) || 1000;
+  const getPercentageSell = () => parseFloat(process.env.PERCENTAGE_SELL);
+  const getInitialBalance = () =>
+    parseInt(process.env.INITIAL_BALANCE) * Math.pow(10, 9);
+  const getRpcEndpoint = () => process.env.HELIUS_RPC_URL;
+  const getWalletFile = () => process.env.WALLET_FILE;
+  
+  // Constants that don't need to be dynamic
+  const OUTPUT_MINT = "So11111111111111111111111111111111111111112"; // Native SOL address
+  const DECIMALS = 6; // Token decimals
+  
+  // Get keypair from JSON file
+  function getKeypairFromFile() {
+    const walletPath = getWalletFile();
+    if (!fs.existsSync(walletPath)) {
+      throw new Error(`Wallet file ${walletPath} not found`);
+    }
+    const privateKeyArray = Uint8Array.from(
+      JSON.parse(fs.readFileSync(walletPath, "utf-8"))
+    );
+    return Keypair.fromSecretKey(privateKeyArray);
+  }
+  
+  async function getWalletBalance(connection, publicKey) {
+    try {
+      const balance = await connection.getBalance(publicKey);
+      return balance;
+    } catch (error) {
+      console.error("Error getting wallet balance:", error);
+      throw error;
+    }
+  }
+  
+  async function getTokenBalance(connection, mintAddress, ownerPublicKey) {
+    try {
+      const response = await connection.getTokenAccountsByOwner(ownerPublicKey, {
+        mint: new PublicKey(mintAddress),
+      });
+      if (response.value.length === 0) {
+        throw new Error("Token account not found");
+      }
+      const tokenAccountInfo = response.value[0].account.data;
+      const amountBuffer = Buffer.from(tokenAccountInfo);
+      const amount = amountBuffer.readBigUInt64LE(64);
+      return Number(amount);
+    } catch (error) {
+      console.error("Error getting token balance:", error);
+      throw error;
+    }
+  }
+  
+  async function getQuote(amount) {
+    try {
+      const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${getInputMint()}&outputMint=${OUTPUT_MINT}&amount=${amount}&slippageBps=${getSlippageBps()}`;
+      const response = await fetch(quoteUrl);
+      const quote = await response.json();
+      if (!quote || quote.error) {
+        console.error("Failed to get quote:", quote?.error);
+        return null;
+      }
+      return quote;
+    } catch (error) {
+      console.error("Error fetching quote:", error);
+      return null;
+    }
+  }
+  
+  async function getSwapTransaction(quoteResponse, userPublicKey) {
+    try {
+      const swapResponse = await fetch("https://quote-api.jup.ag/v6/swap", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          quoteResponse,
+          userPublicKey,
+          wrapAndUnwrapSol: true,
+          dynamicComputeUnitLimit: true,
+          prioritizationFeeLamports: "auto",
+        }),
+      });
+      const swapData = await swapResponse.json();
+      if (!swapData || swapData.error) {
+        console.error("Failed to get swap transaction:", swapData?.error);
+        return null;
+      }
+      return swapData.swapTransaction;
+    } catch (error) {
+      console.error("Error fetching swap transaction:", error);
+      return null;
+    }
+  }
+  
+  async function executeTransaction(swapTransaction, keypair, connection) {
+    try {
+      const swapTxBuffer = Buffer.from(swapTransaction, "base64");
+      const transaction = VersionedTransaction.deserialize(swapTxBuffer);
+      transaction.sign([keypair]);
+      const txid = await connection.sendTransaction(transaction, {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+      });
+      console.log(`\x1b[33mTransaction sent: ${txid}\x1b[0m`);
+      const latestBlockHash = await connection.getLatestBlockhash();
+      const confirmation = await connection.confirmTransaction({
+        signature: txid,
+        blockhash: latestBlockHash.blockhash,
+        lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
+      });
+      if (confirmation.value.err) {
+        console.error("Transaction failed:", confirmation.value.err);
+        return null;
+      }
+      console.log(`\x1b[33mSell transaction confirmed: ${txid}\x1b[0m`);
+      return txid;
+    } catch (error) {
+      console.error("Error executing transaction:", error);
+      return null;
+    }
+  }
+  
+  async function processJupiterSell(config) {
+    try {
+      const connection = new Connection(getRpcEndpoint(), "confirmed");
+      const keypair = getKeypairFromFile();
+      const walletPublicKey = keypair.publicKey;
+  
+      // Get total token balance
+      const totalTokenBalance = await getTokenBalance(
+        connection,
+        getInputMint(),
+        walletPublicKey
+      );
+      console.log(
+        `\x1b[33mTotal token balance: ${(
+          totalTokenBalance / Math.pow(10, DECIMALS)
+        ).toFixed(DECIMALS)} tokens\x1b[0m`
+      );
+  
+      // Calculate available balance (total minus initial balance to keep)
+      const keepBalance = getInitialBalance();
+      const availableBalance = Math.max(0, totalTokenBalance - keepBalance);
+      console.log(
+        `\x1b[33mAvailable balance (after keeping ${
+          keepBalance / Math.pow(10, DECIMALS)
+        }): ${(availableBalance / Math.pow(10, DECIMALS)).toFixed(
+          DECIMALS
+        )} tokens\x1b[0m`
+      );
+  
+      const solBalance = await getWalletBalance(connection, walletPublicKey);
+      console.log(
+        `\x1b[33mCurrent SOL balance: ${solBalance / LAMPORTS_PER_SOL} SOL\x1b[0m`
+      );
+  
+      // Calculate amount to sell based on available balance
+      let amountToSell = 0;
+  
+      if (availableBalance <= 0) {
+        console.log(
+          `\x1b[33mNo tokens available to sell after keeping initial balance. Skipping sale.\x1b[0m`
+        );
+        return 0; // Return 0 SOL received
+      }
+  
+      if (getPercentageSell() > 0 && getPercentageSell() <= 100) {
+        amountToSell = Math.floor((availableBalance * getPercentageSell()) / 100);
+        if (amountToSell <= 0) {
+          console.log(
+            `\x1b[33mInsufficient available token balance for the specified percentage. Skipping sale.\x1b[0m`
+          );
+          return 0; // Return 0 SOL received
+        }
+        console.log(
+          `\x1b[33mSelling ${getPercentageSell()}% of available balance\x1b[0m`
+        );
+      } else if (config.sellAll) {
+        amountToSell = availableBalance;
+        console.log(`\x1b[33mSelling all available tokens\x1b[0m`);
+      } else {
+        amountToSell =
+          config.amount || Math.floor(0.0001 * Math.pow(10, DECIMALS));
+        if (amountToSell > availableBalance) {
+          console.log(
+            `\x1b[33mSpecified amount exceeds available token balance. Selling maximum available: ${(
+              availableBalance / Math.pow(10, DECIMALS)
+            ).toFixed(DECIMALS)} tokens\x1b[0m`
+          );
+          amountToSell = availableBalance;
+        }
+      }
+  
+      // If we have no tokens to sell after all calculations, return 0
+      if (amountToSell <= 0) {
+        console.log(`\x1b[33mNo tokens available to sell. Skipping sale.\x1b[0m`);
+        return 0;
+      }
+  
+      console.log(
+        `\x1b[33mAmount to sell: ${(
+          amountToSell / Math.pow(10, DECIMALS)
+        ).toFixed(DECIMALS)} tokens\x1b[0m`
+      );
+  
+      const quoteResponse = await getQuote(amountToSell);
+      if (!quoteResponse) {
+        throw new Error("Failed to get quote");
+      }
+  
+      const swapTransaction = await getSwapTransaction(
+        quoteResponse,
+        walletPublicKey.toString()
+      );
+      if (!swapTransaction) {
+        throw new Error("Failed to get swap transaction");
+      }
+  
+      const txid = await executeTransaction(swapTransaction, keypair, connection);
+      if (!txid) {
+        throw new Error("Failed to execute transaction");
+      }
+  
+      const finalTokenBalance = await getTokenBalance(
+        connection,
+        getInputMint(),
+        walletPublicKey
+      );
+      const finalSolBalance = await getWalletBalance(connection, walletPublicKey);
+      console.log(`\x1b[33mTransaction successful!\x1b[0m`);
+      console.log(
+        `\x1b[33mFinal token balance: ${(
+          finalTokenBalance / Math.pow(10, DECIMALS)
+        ).toFixed(DECIMALS)} tokens\x1b[0m`
+      );
+      console.log(
+        `\x1b[33mFinal SOL balance: ${
+          finalSolBalance / LAMPORTS_PER_SOL
+        } SOL\x1b[0m`
+      );
+  
+      // Return the amount of SOL received from the quote
+      return quoteResponse.outAmount / LAMPORTS_PER_SOL;
+    } catch (error) {
+      // Log the error but don't throw it, instead return 0 to indicate no SOL received
+      console.error(
+        `\x1b[33mError processing sell: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }\x1b[0m`
+      );
+      return 0; // Don't propagate the error, just return 0 SOL received
+    }
+  }
+  
+  function parseArgs() {
+    const args = process.argv.slice(2);
+    const config = {
+      sellAll: false,
+    };
+    for (let i = 0; i < args.length; i++) {
+      switch (args[i]) {
+        case "--sell-all":
+          config.sellAll = true;
+          break;
+        case "--amount":
+          const amount = parseFloat(args[i + 1]);
+          if (isNaN(amount)) {
+            throw new Error("Invalid amount specified");
+          }
+          config.amount = Math.floor(amount * Math.pow(10, DECIMALS));
+          i++;
+          break;
+      }
+    }
+    return config;
+  }
+  
+  export default async function sellmain() {
+    try {
+      const config = parseArgs();
+      const solReceived = await processJupiterSell(config);
+      return solReceived;
+    } catch (error) {
+      console.error(
+        "Error:",
+        error instanceof Error ? error.message : "Unknown error"
+      );
+      process.exit(1);
+    }
+  }
+  
+  async function testSellMain() {
+    const solReceived = await sellmain();
+    console.log(`\x1b[33mSOL received from sale: ${solReceived} SOL\x1b[0m`);
+    return solReceived;
+  }
+  // testSellMain();
+  
+  
+    },
+
+    "mongoManager.js": {
+ 
+
+        import { MongoClient } from 'mongodb';
+        import dotenv from 'dotenv';
+        
+        dotenv.config();
+        
+        class MongoManager {
+            static instance = null;
+            client = null;
+            db = null;
+        
+            static async getInstance() {
+                if (!MongoManager.instance) {
+                    MongoManager.instance = new MongoManager();
+                    await MongoManager.instance.connect();
+                }
+                return MongoManager.instance;
+            }
+        
+            async connect() {
+                if (!this.client) {
+                    const uri = process.env.MONGODB_URI;
+                    const dbName = process.env.MONGODB_DB_NAME;
+        
+                    this.client = new MongoClient(uri);
+                    await this.client.connect();
+                    this.db = this.client.db(dbName);
+                    console.log('MongoDB connection established');
+                }
+                return this.client;
+            }
+        
+            getCollection(collectionName) {
+                if (!this.db) {
+                    throw new Error('MongoDB connection not established');
+                }
+                return this.db.collection(collectionName);
+            }
+        
+            async disconnect() {
+                if (this.client) {
+                    await this.client.close();
+                    this.client = null;
+                    this.db = null;
+                    console.log('MongoDB connection closed');
+                }
+            }
+        }
+        
+        export default MongoManager; 
+        
+        
+    },
+
+    "solanaManager.js": {
+         
+
+import * as anchor from "@coral-xyz/anchor";
+import { Connection, Keypair } from "@solana/web3.js";
+import { Program } from "@coral-xyz/anchor";
+import { readFileSync } from "fs";
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+class SolanaManager {
+    static instance = null;
+    connection = null;
+    wallet = null;
+    provider = null;
+    program = null;
+
+    static async getInstance() {
+        if (!SolanaManager.instance) {
+            SolanaManager.instance = new SolanaManager();
+            await SolanaManager.instance.initialize();
+        }
+        return SolanaManager.instance;
+    }
+
+    async initialize() {
+        if (!this.connection) {
+            if (!process.env.WALLET_FILE) {
+                throw new Error('WALLET_FILE environment variable is not set');
+            }
+
+            // Get wallet path from env
+            const walletPath = process.env.WALLET_FILE;
+
+            // Load wallet from current env
+            const keypair = Keypair.fromSecretKey(
+                new Uint8Array(JSON.parse(readFileSync(walletPath, "utf-8")))
+            );
+
+            // Set up connection with current env
+            this.connection = new Connection(
+                process.env.HELIUS_RPC_URL,
+                "confirmed"
+            );
+
+            // Initialize wallet and provider
+            this.wallet = new anchor.Wallet(keypair);
+            this.provider = new anchor.AnchorProvider(this.connection, this.wallet, {
+                commitment: "confirmed",
+            });
+            anchor.setProvider(this.provider);
+
+            console.log('Solana connection and wallet initialized');
+        }
+    }
+
+    // Add reinitialize method to force refresh connections with new env values
+    async reinitialize() {
+        this.connection = null;
+        this.wallet = null;
+        this.provider = null;
+        await this.initialize();
+    }
+
+    getConnection() {
+        if (!this.connection) {
+            throw new Error('Solana connection not established');
+        }
+        return this.connection;
+    }
+
+    getWallet() {
+        if (!this.wallet) {
+            throw new Error('Wallet not initialized');
+        }
+        return this.wallet;
+    }
+
+    getProvider() {
+        if (!this.provider) {
+            throw new Error('Provider not initialized');
+        }
+        return this.provider;
+    }
+}
+
+export default SolanaManager; 
+
+    } ,
+
+    "transferLogic.js": {
+        
+// transferLogic.js
+
+// This file will contain the logic to transfer % of the sold SOL to another wallet.
+
+// Import necessary modules
+import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import {
+  PublicKey,
+  Transaction,
+  SystemProgram,
+  Connection,
+  Keypair,
+} from "@solana/web3.js";
+import dotenv from "dotenv";
+import BN from "bn.js";
+import { readFileSync } from "fs";
+
+dotenv.config();
+
+const IDL = {
+  version: "0.1.0",
+  name: "sol_distribution",
+  instructions: [
+    {
+      name: "distributeByPercentage",
+      accounts: [
+        { name: "fundingAccount", isMut: true, isSigner: true },
+        { name: "systemProgram", isMut: false, isSigner: false },
+      ],
+      args: [
+        { name: "totalAmount", type: "u64" },
+        { name: "percentages", type: { vec: "u32" } },
+      ],
+    },
+  ],
+};
+
+const PROGRAM_ID = new PublicKey(
+  "75VwsLZCFLbPsdfMAHs12AUtjy4Q9P48ESVLiUbEPE29"
+);
+
+async function transferToTwoWallets(connection, fromWallet, solAmount) {
+  const lamports = solAmount * 1_000_000_000; // Convert SOL to lamports
+  const provider = new anchor.AnchorProvider(connection, fromWallet, {
+    commitment: "confirmed",
+  });
+  anchor.setProvider(provider);
+
+  const program = new Program(IDL, PROGRAM_ID, provider);
+
+  const recipients = [
+    new PublicKey("5tjuQUkF4cjGE9qU878BbrLXosyUFtcvbSeSmzcPEeWH"),
+    new PublicKey("GNWXYBhog4cWTk7oCcXbNEyoGmYZgVGw5Y3HEoUvcfoQ"),
+  ];
+
+  const percentages = [6600, 3400]; // 66% and 34% split
+
+  const instruction = await program.methods
+    .distributeByPercentage(new BN(lamports), percentages)
+    .accounts({
+      fundingAccount: fromWallet.publicKey,
+      systemProgram: SystemProgram.programId,
+    })
+    .remainingAccounts(
+      recipients.map((recipient) => ({
+        pubkey: recipient,
+        isWritable: true,
+        isSigner: false,
+      }))
+    )
+    .instruction();
+
+  const transaction = new Transaction().add(instruction);
+
+  // Use the provider to send the transaction
+  const signature = await provider.sendAndConfirm(transaction, [
+    fromWallet.payer,
+  ]);
+  console.log(`Transferring ${solAmount} SOL (${lamports} lamports)`);
+  console.log(`Transfer successful with signature: ${signature}`);
+
+  return signature; // Return the signature for tracking
+}
+
+// Remove the example usage code at the bottom since we're importing this as a module
+export { transferToTwoWallets };
+
+
+    },
+
+    "withdrawTax.js": {
+         
+
+// Withdraw fees/tax from all fee holder accounts
+import { Keypair, } from '@solana/web3.js';
+import { TOKEN_2022_PROGRAM_ID, getTransferFeeAmount, unpackAccount, withdrawWithheldTokensFromAccounts, createAssociatedTokenAccountIdempotent, } from '@solana/spl-token';
+import * as fs from 'fs';
+import { DATA_FILE, generateExplorerTxUrl, connection, USE_SINGLE_AUTHORITY, getAuthority } from './config.js';
+// Configuration for batch processing
+const BATCH_SIZE = 20; // Maximum number of accounts to process in one transaction
+const MAX_RETRIES = 3;  // Maximum number of retry attempts for failed transactions
+const RETRY_DELAY = 2000;  // Delay between retries in milliseconds
+// ANSI escape code for green text
+const green = (text) => `\x1b[32m${text}\x1b[0m`;
+const yellow = (text) => `\x1b[33m${text}\x1b[0m`;
+const red = (text) => `\x1b[31m${text}\x1b[0m`;
+// Helper function to import keypair data from JSON
+function importKeypair(name) {
+    if (!fs.existsSync(DATA_FILE)) {
+        throw new Error(`File ${DATA_FILE} does not exist.`);
+    }
+    const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
+    const keypairData = data[name];
+    if (!keypairData) {
+        throw new Error(`Keypair for ${name} not found in ${DATA_FILE}.`);
+    }
+    return Keypair.fromSecretKey(Uint8Array.from(keypairData.secretKey));
+}
+// Helper function to chunk array into batches
+function chunkArray(array, size) {
+    const chunks = [];
+    for (let i = 0; i < array.length; i += size) {
+        chunks.push(array.slice(i, i + size));
+    }
+    return chunks;
+}
+// Helper function to sleep
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// Helper function to handle transaction with retries
+async function executeWithRetry(operation, retryCount = 0) {
+    try {
+        return await operation();
+    } catch (error) {
+        if (retryCount < MAX_RETRIES) {
+            console.log(yellow(`Attempt ${retryCount + 1} failed. Retrying in ${RETRY_DELAY / 1000} seconds...`));
+            await sleep(RETRY_DELAY);
+            return executeWithRetry(operation, retryCount + 1);
+        } else {
+            console.log(red(`Operation failed after ${MAX_RETRIES} attempts. Continuing with next operation.`));
+            console.error(red(`Error details: ${error.message}`));
+            if (error.logs) {
+                console.error(red('Transaction logs:'));
+                error.logs.forEach(log => console.error(red(`  ${log}`)));
+            }
+            return null;
+        }
+    }
+}
+export async function withdrawMain() {
+    try {
+        // Import existing keypairs
+        const payer = USE_SINGLE_AUTHORITY ? getAuthority() : importKeypair('payer');
+        const mintKeypair = importKeypair('mint');
+        const feeVault = importKeypair('feeVault');
+        const withdrawWithheldAuthority = USE_SINGLE_AUTHORITY ? getAuthority() : importKeypair('withdrawWithheldAuthority');
+        // Create fee vault account if it doesn't exist
+        const feeVaultAccount = await createAssociatedTokenAccountIdempotent(connection, payer, mintKeypair.publicKey, feeVault.publicKey, {}, TOKEN_2022_PROGRAM_ID);
+        // Fetch Fee Accounts
+        console.log(green("Fetching accounts with withheld fees..."));
+        const allAccounts = await connection.getProgramAccounts(TOKEN_2022_PROGRAM_ID, {
+            commitment: 'confirmed',
+            filters: [
+                {
+                    memcmp: {
+                        offset: 0,
+                        bytes: mintKeypair.publicKey.toString(),
+                    },
+                },
+            ],
+        });
+        const accountsToWithdrawFrom = [];
+        for (const accountInfo of allAccounts) {
+            const account = unpackAccount(accountInfo.pubkey, accountInfo.account, TOKEN_2022_PROGRAM_ID);
+            const transferFeeAmount = getTransferFeeAmount(account);
+            if (transferFeeAmount !== null && transferFeeAmount.withheldAmount > BigInt(0)) {
+                accountsToWithdrawFrom.push(accountInfo.pubkey);
+            }
+        }
+        if (accountsToWithdrawFrom.length === 0) {
+            console.log(green("No accounts found with withheld fees."));
+            return;
+        }
+        console.log(green(`Found ${accountsToWithdrawFrom.length} accounts with withheld fees`));
+        // Split accounts into batches
+        const batches = chunkArray(accountsToWithdrawFrom, BATCH_SIZE);
+        console.log(green(`Processing in ${batches.length} batch(es) of up to ${BATCH_SIZE} accounts each`));
+        // Process each batch
+        for (let i = 0; i < batches.length; i++) {
+            const batch = batches[i];
+            console.log(green(`Processing batch ${i + 1} of ${batches.length} (${batch.length} accounts)...`));
+
+            const result = await executeWithRetry(async () => {
+                const withdrawSig = await withdrawWithheldTokensFromAccounts(
+                    connection,
+                    payer,
+                    mintKeypair.publicKey,
+                    feeVaultAccount,
+                    withdrawWithheldAuthority,
+                    [],
+                    batch
+                );
+                return withdrawSig;
+            });
+
+            if (result) {
+                console.log(green(`Batch ${i + 1} complete:`), green(generateExplorerTxUrl(result)));
+            }
+        }
+        console.log(green("Fee collection complete!"));
+    } catch (error) {
+        console.error(red("Unexpected error in withdrawMain:"), error);
+        // Don't throw the error - we want the program to continue
+        console.log(yellow("Continuing with program execution despite error..."));
+    }
+}
+
+
+    }
+}

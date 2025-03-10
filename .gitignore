@@ -1,0 +1,6 @@
+# .env
+wallet1.json
+tax_collector.json 
+data.json 
+
+node_modules
